@@ -162,6 +162,58 @@
                            item-errors)))
                item-errors))))))
 
+(defgeneric error-template (error-type)
+  (:documentation "Return a template to render an error of type ERROR-TYPE. A template is a list of a format string, and keys into the error object used to render the template.")
+  (:method ((error-type (eql :wrong-type)))
+    '("The value ~S is not of type ~S" :got :expected))
+  (:method ((error-type (eql :wrong-length)))
+    '("Object of length ~S is not of length (at least) ~S" :got :expected))
+  (:method ((error-type (eql :trailing-elements)))
+    '("Object of exact type has trailing elements"))
+  (:method ((error-type (eql :missing-key)))
+    '("Object does not have the key ~S" :key))
+  (:method ((error-type (eql :extra-keys)))
+    '("Object of exact type has extra keys ~S" (lambda (error)
+                                                 (set-difference (gethash :got error)
+                                                                 (gethash :expected)
+                                                                 :test #'equal)))))
+
+(define-condition invalid-template-key ()
+  ((key :initarg :key :reader template-key)
+   (error-data :initarg :error :reader template-error))
+  (:report (lambda (c stream)
+             (format stream "Invalid key ~S while rendering report for error ~S"
+                     (template-key c)
+                     (template-error c)))))
+
+(defun render-error-template (template error)
+  (check-type template list)
+  (check-type (first template) string)
+  (check-type error hash-table)
+
+  (apply #'format nil (first template)
+         (mapcar (lambda (key)
+                   (etypecase key
+                     (keyword (multiple-value-bind (val present)
+                                  (gethash key error)
+                                (unless present
+                                  (error 'invalid-template-key :key key :error error))
+                                val))
+                     (function (funcall key error))))
+                 (rest template))))
+
+(defun print-json-path (path stream)
+  ;; Paths are reversed (deepest first)
+  (format stream "$~{[~S]~}" (reverse path)))
+
+(defun error-report (error stream)
+  (let* ((type (gethash :error-type error))
+         (path (gethash :path error))
+         (template (error-template type)))
+    (format stream "~A: ~A"
+            (with-output-to-string (str)
+              (print-json-path path str))
+            (render-error-template template error))))
 
 (defun validate-json (json typespec)
   (let* ((cl-json:*json-array-type* 'vector)
