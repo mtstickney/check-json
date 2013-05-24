@@ -13,17 +13,15 @@
   (cond
     ((equal str "false") 'json-bool:false)
     ((equal str "true") 'json-bool:true)
+    ((equal str "null") nil)
     (t (error "Unknown boolean token ~S" str))))
-
-(defmacro values-of (call)
-  `(apply #'values (multiple-value-list ,call)))
 
 (defun check-typespec (obj spec path)
   (check-type spec (or keyword list))
   (check-type path list)
   (if (keywordp spec)
-      (values-of (check-obj-type obj spec '() path))
-      (values-of (check-obj-type obj (first spec) (rest spec) path))))
+      (obj-type-errors obj spec '() path)
+      (obj-type-errors obj (first spec) (rest spec) path)))
 
 (defun dict (&rest entries)
   (let* ((i (length entries))
@@ -33,103 +31,145 @@
                 (second e)))
     m))
 
-(defgeneric check-obj-type (json-obj type type-args path)
-  (:documentation "Return T if JSON-OBJ is of the type described by SCHEMA."))
+(defgeneric obj-type-errors (json-obj type type-args path)
+  (:documentation "Return a list of errors when validating JSON-OBJ against TYPE."))
 
-(defmethod check-obj-type :around (json-obj type type-args path)
+(defmethod obj-type-errors :around (json-obj type type-args path)
   (check-type path list)
   (call-next-method json-obj type type-args path))
 
-(defmethod check-obj-type (json-obj (type (eql :number)) type-args path)
+;; Wildcard, always true
+(defmethod obj-type-errors (json-obj (type (eql :*)) type-args path)
   (check-type type-args null)
-  (or (numberp json-obj)
-      (values nil (list (dict :path path
-                              :expected-type :number
-                              :value json-obj)))))
+  '())
 
-(defmethod check-obj-type (json-obj (type (eql :string)) type-args path)
+(defmethod obj-type-errors (json-obj (type (eql :number)) type-args path)
   (check-type type-args null)
-  (or (stringp json-obj)
-      (values nil (list (dict :path path
-                              :expected-type :string
-                              :value json-obj)))))
+  (if (not (numberp json-obj))
+      (list (dict :path path
+                  :error-type :wrong-type
+                  :expected :number
+                  :got json-obj))
+      '()))
 
-(defmethod check-obj-type (json-obj (type (eql :bool)) type-args path)
+(defmethod obj-type-errors (json-obj (type (eql :string)) type-args path)
   (check-type type-args null)
-  (or (eq json-obj 'json-bool:true)
-      (eq json-obj 'json-bool:false)
-      (values nil (list (dict :path path
-                              :expected-type :bool
-                              :value json-obj)))))
+  (if (not (stringp json-obj))
+      (list (dict :path path
+                  :error-type :wrong-type
+                  :expected :string
+                  :got json-obj))
+      '()))
 
-(defun map-if (func seq &rest seqs)
-  (check-type func function)
-  (check-type seq sequence)
-  (loop for s in seqs do (check-type s sequence))
+(defmethod obj-type-errors (json-obj (type (eql :bool)) type-args path)
+  (check-type type-args null)
+  (if (or (eq json-obj 'json-bool:true)
+          (eq json-obj 'json-bool:false))
+      '()
+      (list (dict :path path
+                  :error-type :wrong-type
+                  :expected :bool
+                  :got json-obj))))
 
-  (let ((args (apply #'mapcar #'list seq seqs))
-        (results '()))
-    (loop for a in args
-       do (let ((result (apply func a)))
-            (when result
-              (push result results))))
-    (nreverse results)))
+(defmethod obj-type-errors (json-obj (type (eql :null)) type-args path)
+  (check-type type-args null)
+  (if (not (null json-obj))
+      (list (dict :path path
+                  :error-type :wrong-type
+                  :expected :null
+                  :got json-obj))))
 
-(defmethod check-obj-type (json-obj (type (eql :array)) type-args path)
+(defmethod obj-type-errors (json-obj (type (eql :array)) type-args path)
   (check-type type-args list)
   (destructuring-bind ((&key exact) &rest item-types) type-args
-    (let ((errors '()))
-      ;; Argh, this is getting into heuristic-land
-      (unless (and (typep json-obj 'vector)
-                   (not (typep json-obj 'string)))
-        ;; Stop checking on a top-level type error
-        (return-from check-obj-type
-          (values nil
-                  (list (dict :path path
-                              :expected-type :array
-                              :value json-obj)))))
-      (loop for i from 0
-         for error-lst in (map 'list
-                               (lambda (elt type)
-                                 (nth-value 1 (check-typespec elt type (cons i path))))
-                               json-obj
-                               item-types)
-         do (when (not (endp error-lst))
-              (setf errors (nconc error-lst errors))))
-      (when exact
-        (unless (= (length json-obj) (length item-types))
-          (push (dict :path path
-                      :expected-type `(:array ,(length item-types))
-                      :value json-obj)
-                errors)))
-      (if (endp errors)
-          t
-          (values nil errors)))))
+    (cond
+      ;; Need to separate vectors and strings here, despite the subtype
+      ((or (not (typep json-obj 'vector))
+           (typep json-obj 'string))
+       (list (dict :path path
+                   :error-type :wrong-type
 
-(defun validate-key-spec (obj key-spec)
+                   :expected :array
+                   :got json-obj)))
+      ((> (length item-types) (length json-obj))
+       (list (dict :path path
+                   :error-type :wrong-length
+                   :expected (length item-types)
+                   :got (length json-obj))))
+      (t (let ((item-errors (reduce #'append
+                                    (map 'list
+                                         #'check-typespec
+                                         json-obj
+                                         item-types
+                                         (loop for i from 0 to (length json-obj)
+                                            collect (cons i path))))))
+           (if (and exact (not (= (length json-obj) (length item-types))))
+               (cons (dict :path path
+                           :error-type :trailing-elements)
+                     item-errors)
+               item-errors))))))
+
+(defun key-spec-key (key-spec)
+  (typecase key-spec
+    (cons (car key-spec))
+    (otherwise key-spec)))
+
+;; Note: path is the path to the hash, not the key
+(defun key-spec-errors (obj key-spec path)
   (flet ((find-key (key obj)
            (find-if (lambda (cell)
                       (equal (car cell) key))
                     obj)))
-    (typecase key-spec
-      (cons (let ((cell (find-key (car key-spec) obj)))
-              (and cell
-                   (check-typespec (cdr cell) (cdr key-spec)))))
-      (otherwise (find-key key-spec obj)))))
+    (let* ((key (key-spec-key key-spec))
+           (cell (find-key key obj)))
+      (cond
+        ((null cell)
+         (list (dict :path path
+                     :error-type :missing-key
+                     :key key)))
+        ((consp key-spec)
+         (check-typespec (cdr cell) (cdr key-spec) (cons key path)))
+        (t t)))))
 
-(defmethod check-obj-type (json-obj (type (eql :hash)) type-args)
+(defmethod obj-type-errors (json-obj (type (eql :hash)) type-args path)
   (check-type type-args list)
   (destructuring-bind ((&key exact) &rest key-types) type-args
-    (and (typep json-obj 'list)
-         (every #'consp json-obj)
-         (every (lambda (key-type)
-                  (validate-key-spec json-obj key-type))
-                key-types))))
+    (cond
+      ((or (not (typep json-obj 'list))
+           (notevery #'consp json-obj))
+       (list (dict :path path
+                   :error-type :wrong-type
+                   :expected :hash
+                   :got json-obj)))
+      (t (let ((item-errors (reduce #'append
+                                    (map 'list
+                                         (lambda (key-type)
+                                           (key-spec-errors json-obj key-type path))
+                                         key-types))))
+           (if exact
+               (let ((obj-keys (remove-duplicates json-obj
+                                                  :test #'equal
+                                                  :key #'car))
+                     (type-keys (remove-duplicates key-types
+                                                   :test #'equal
+                                                   :key #'key-spec-key)))
+                 (if (= (length obj-keys) (length type-keys))
+                     item-errors
+                     (cons (dict :path path
+                                 :error-type :extra-keys
+                                 :expected (mapcar #'key-spec-key type-keys)
+                                 :got (mapcar #'car obj-keys))
+                           item-errors)))
+               item-errors))))))
+
 
 (defun validate-json (json typespec)
   (let* ((cl-json:*json-array-type* 'vector)
          (cl-json:*boolean-handler* #'read-bool)
-         (obj (cl-json:decode-json-from-string json)))
-    (check-typespec obj typespec)))
+         (obj (cl-json:decode-json-from-string json))
+         (errors (check-typespec obj typespec '())))
+    (if (endp errors)
+        t
+        (values nil (nreverse errors)))))
 
 ;;; "check-json" goes here. Hacks and glory await!
